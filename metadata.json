@@ -1,0 +1,7 @@
+{
+  "name": "MOT关键时刻｜中文语音对练陪练",
+  "description": "一个专业的MOT（关键时刻）中文语音对练系统，通过Gemini Live API与TTS双通道技术，提供沉浸式的服务场景对练，并给出结构化的实时教练建议。",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
