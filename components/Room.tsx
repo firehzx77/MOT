@@ -133,10 +133,13 @@ const Room: React.FC<RoomProps> = ({ config, onFinish, onBack }) => {
               if (hasContent) setIsProcessing(false);
             }
 
-            // 1) 播放模型音频
-            const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (audioData) {
-              playAudioChunk(audioData);
+            // 1) 播放模型音频（可能一次 message 带多个音频 chunk）
+            const parts = message.serverContent?.modelTurn?.parts;
+            if (Array.isArray(parts)) {
+              for (const p of parts) {
+                const data = p?.inlineData?.data;
+                if (data) playAudioChunk(data);
+              }
             }
 
             // 2) 用户转写（流式）
@@ -249,8 +252,12 @@ const Room: React.FC<RoomProps> = ({ config, onFinish, onBack }) => {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
+      // 尝试用 16k（若浏览器不支持，会回退到设备采样率；以 ctx.sampleRate 为准传给 Live）
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       recCtxRef.current = ctx;
+
+      // 某些浏览器需要用户手势触发 resume
+      try { await ctx.resume(); } catch {}
 
       const source = ctx.createMediaStreamSource(stream);
       recSourceRef.current = source;
@@ -260,8 +267,10 @@ const Room: React.FC<RoomProps> = ({ config, onFinish, onBack }) => {
 
       processor.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
+        // ⚠️ Live API Web SDK: sendRealtimeInput 必须用 audio 字段（不是 media）
+        // 并且 rate 要与实际采样率一致，否则服务端会误解音频速度。
         sessionRef.current?.sendRealtimeInput({
-          media: { data: createPcmBlob(inputData), mimeType: 'audio/pcm;rate=16000' }
+          audio: { data: createPcmBlob(inputData), mimeType: `audio/pcm;rate=${ctx.sampleRate}` }
         });
       };
 
@@ -296,11 +305,9 @@ const Room: React.FC<RoomProps> = ({ config, onFinish, onBack }) => {
     // 只有在停止录音且未收到反馈前显示 Loading
     setIsProcessing(true);
 
-    // 告诉 Live：本轮结束
-    sessionRef.current?.sendRealtimeInput({
-      media: { data: '', mimeType: 'audio/pcm;rate=16000' },
-      end_of_turn: true
-    });
+    // 告诉 Live：音频流结束（按住说话/松开结束 这种模式建议显式发送）
+    // Live 会基于 VAD 自动触发回复；audioStreamEnd 让服务端明确“麦克风关闭了”。
+    sessionRef.current?.sendRealtimeInput({ audioStreamEnd: true });
 
     // 如果没有任何文字转写，更新占位符
     if (!fullUserTextRef.current && currentUserMsgIdRef.current) {

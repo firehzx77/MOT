@@ -17,7 +17,8 @@ export default async function handler(req: any, res: any) {
     const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "Missing GEMINI_API_KEY/GOOGLE_API_KEY" });
 
-    const ai = new GoogleGenAI({ apiKey });
+    // Ephemeral Token 用于 Live：目前要求 v1alpha
+    const ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: "v1alpha" } });
 
     const body = req.body || {};
     const model = body.model || "gemini-2.5-flash-native-audio-preview-12-2025";
@@ -33,7 +34,8 @@ export default async function handler(req: any, res: any) {
         expireTime,
         newSessionExpireTime,
         // 关键：把 Live 的配置锁在服务端（更安全）
-        liveConnectConstraints: {
+        // JS SDK 字段名为 bidiGenerateContentSetup
+        bidiGenerateContentSetup: {
           model,
           config: {
             sessionResumption: {},          // 允许断线续连
@@ -41,7 +43,6 @@ export default async function handler(req: any, res: any) {
             responseModalities: ["AUDIO"],  // 语音对练
           },
         },
-        httpOptions: { apiVersion: "v1alpha" }, // Ephemeral Token 目前用于 Live API v1alpha
       },
     });
 
