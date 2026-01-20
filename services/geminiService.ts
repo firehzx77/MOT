@@ -1,117 +1,107 @@
-
-import { GoogleGenAI, Modality, Type, GenerateContentResponse } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
 import { PracticeConfig, MOTStage, ScoringResult } from "../types";
 import { MOT_PLAYBOOK } from "../constants";
 
+type LiveTokenResp = {
+  token: string;
+  expireTime: string;
+  newSessionExpireTime: string;
+  model: string;
+};
+
+type TTSResp = {
+  mimeType: string;      // "audio/wav"
+  audioBase64: string;   // wav base64（后端已封装 wav header）
+  sampleRate: number;
+  channels: number;
+  voiceName: string;
+  model: string;
+};
+
+async function postJSON<T>(url: string, body: any): Promise<T> {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`POST ${url} failed: ${r.status} ${text}`);
+  }
+  return (await r.json()) as T;
+}
+
 export class GeminiService {
-  // Guidelines: Do not create GoogleGenAI when the component is first rendered.
-  // Instead, create it right before making API calls.
-
+  /**
+   * ✅ TTS 改为走后端：/api/tts
+   * 后端会用 GEMINI_API_KEY 调 Gemini TTS，并返回 wav(base64)
+   */
   async getTTSAudio(text: string, voiceName: string): Promise<string> {
-    // Always use new GoogleGenAI({apiKey: process.env.API_KEY});
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `用中文读出：${text}` }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName },
-          },
-        },
-      },
+    const data = await postJSON<TTSResp>("/api/tts", {
+      text,
+      voiceName,
+      // style: "温和/专业/安抚/坚定" 你也可以传
+      // model: "gemini-2.5-flash-preview-tts"
     });
-
-    // Access the .text property directly (property, not a method)
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Audio) throw new Error("TTS Failed to generate audio");
-    return base64Audio;
+    return data.audioBase64; // wav base64
   }
 
+  /**
+   * ✅ 评分改为走后端：/api/review
+   * 后端会用 structured JSON schema 输出稳定结构
+   */
   async scoreRound(
-    stage: MOTStage, 
-    userTranscript: string, 
+    stage: MOTStage,
+    userTranscript: string,
     customerText: string,
     practiceConfig: PracticeConfig
   ): Promise<ScoringResult> {
-    const playbook = MOT_PLAYBOOK[stage];
-    
-    const prompt = `
-      你是专业的企业服务培训专家。请对这一轮的MOT对话进行评分。
-      
-      场景：${practiceConfig.industry}
-      客户画像：${practiceConfig.persona}
-      当前关卡：${stage}
-      规则摘要：${playbook.definition}
-      
-      对话记录：
-      用户（服务者）："${userTranscript}"
-      客户回应："${customerText}"
-      
-      根据对话质量，给出结构化评分。
-    `;
+    // 你现在的 ScoringResult 结构如果和后端不完全一致，可在这里做一次映射
+    const transcript = `用户（服务者）："${userTranscript}"\n客户回应："${customerText}"`;
+    const scenario = `${practiceConfig.industry}｜${practiceConfig.persona}｜${stage}`;
 
-    // Instantiate right before call
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            stage: { type: Type.STRING },
-            stage_goal_hit: { type: Type.NUMBER },
-            dimension_scores: {
-              type: Type.OBJECT,
-              properties: {
-                "倾听与复述": { type: Type.NUMBER },
-                "澄清与提问": { type: Type.NUMBER },
-                "共情与态度": { type: Type.NUMBER },
-                "方案与承诺清晰": { type: Type.NUMBER },
-                "确认闭环": { type: Type.NUMBER }
-              },
-              required: ["倾听与复述", "澄清与提问", "共情与态度", "方案与承诺清晰", "确认闭环"]
-            },
-            highlights: { type: Type.ARRAY, items: { type: Type.STRING } },
-            improvements: { type: Type.ARRAY, items: { type: Type.STRING } },
-            better_script: { type: Type.STRING },
-            next_move: { type: Type.STRING },
-            risk_alert: { type: Type.STRING }
-          },
-          required: ["stage", "stage_goal_hit", "dimension_scores", "highlights", "improvements", "better_script", "next_move"]
-        }
-      }
+    const result = await postJSON<ScoringResult>("/api/review", {
+      scenario,
+      transcript,
+      // model: "gemini-2.5-flash"
     });
 
-    // Directly access .text property
-    const jsonStr = response.text || "{}";
-    return JSON.parse(jsonStr);
+    return result;
   }
 
-  connectLive(config: PracticeConfig, callbacks: any) {
+  /**
+   * ✅ Live 连接：先向后端拿 ephemeral token（/api/live-token），再用 token 作为 apiKey 去连 Live
+   * 这里必须 async
+   */
+  async connectLive(config: PracticeConfig, callbacks: any) {
     const playbook = MOT_PLAYBOOK[config.stage];
-    
-    const systemInstruction = `
-      你扮演一名在“${config.industry}”场景下的客户。你的画像是“${config.persona}”。
-      现在正在进行MOT（关键时刻）实战对练。
-      当前阶段目标：${config.stage} - ${playbook.definition}
-      
-      你的任务：
-      1. 用简体中文对话，高度口语化，像一个真实的客户。
-      2. 针对学员（用户）的发言做出自然回应。
-      3. 考验学员是否能完成当前MOT阶段的目标。
-      4. 每次回复尽量保持在1-2句话，精简有力。
-      5. 不要输出任何评分，不要输出JSON。
-      6. 如果学员表现得不专业，你可以表达不满或犹豫，制造真实挑战。
-    `;
 
-    // Instantiate right before call
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const systemInstruction = `
+你扮演一名在“${config.industry}”场景下的客户。你的画像是“${config.persona}”。
+现在正在进行MOT（关键时刻）实战对练。
+当前阶段目标：${config.stage} - ${playbook.definition}
+
+你的任务：
+1. 用简体中文对话，高度口语化，像一个真实的客户。
+2. 针对学员（用户）的发言做出自然回应。
+3. 考验学员是否能完成当前MOT阶段的目标。
+4. 每次回复尽量保持在1-2句话，精简有力。
+5. 不要输出任何评分，不要输出JSON。
+6. 如果学员表现得不专业，你可以表达不满或犹豫，制造真实挑战。
+`.trim();
+
+    // 1) 向后端拿 token（不暴露长期 key）
+    const tokenResp = await postJSON<LiveTokenResp>("/api/live-token", {
+      model: "gemini-2.5-flash-native-audio-preview-12-2025",
+      temperature: 0.7,
+    });
+
+    // 2) 用 ephemeral token 作为 apiKey 创建客户端
+    const ai = new GoogleGenAI({ apiKey: tokenResp.token });
+
+    // 3) 连接 Live（这里继续用你原本的音频模式）
     return ai.live.connect({
-      model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+      model: tokenResp.model,
       callbacks,
       config: {
         responseModalities: [Modality.AUDIO],
@@ -119,9 +109,9 @@ export class GeminiService {
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
         },
-      }
+      },
     });
   }
 }
