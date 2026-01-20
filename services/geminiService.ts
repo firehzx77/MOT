@@ -18,37 +18,142 @@ type TTSResp = {
   model: string;
 };
 
+// ✅ 允许：前端在 GH Pages，后端在 Vercel（跨域）
+//   - 本地 / 同域部署：VITE_API_BASE_URL 留空即可
+//   - GH Pages：VITE_API_BASE_URL = "https://你的vercel域名"
+const API_BASE =
+  (typeof import.meta !== "undefined" &&
+    (import.meta as any).env &&
+    (import.meta as any).env.VITE_API_BASE_URL) ||
+  "";
+
+function toUrl(path: string) {
+  if (!path) return path;
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  if (!API_BASE) return path; // 同域
+  // 组合成 https://xxx.vercel.app + /api/...
+  return `${API_BASE.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
+}
+
 async function postJSON<T>(url: string, body: any): Promise<T> {
-  const r = await fetch(url, {
+  const finalUrl = toUrl(url);
+  const r = await fetch(finalUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
   });
+
   if (!r.ok) {
     const text = await r.text().catch(() => "");
-    throw new Error(`POST ${url} failed: ${r.status} ${text}`);
+    throw new Error(`POST ${finalUrl} failed: ${r.status} ${text}`);
   }
   return (await r.json()) as T;
 }
 
+/**
+ * ✅ 评分结果归一化：兼容不同后端 schema
+ *  - 如果后端已经是 ScoringResult（含 dimension_scores 等）→ 直接返回
+ *  - 如果后端是 {overallScore, dimensionScores, keyMoments, ...} → 映射成旧结构
+ */
+function normalizeScore(raw: any, stage: MOTStage): ScoringResult {
+  if (!raw || typeof raw !== "object") return raw as ScoringResult;
+
+  // 1) 如果已经是“旧结构”（你 UI 很可能用这个）
+  if (raw.dimension_scores && raw.highlights && raw.improvements) {
+    return raw as ScoringResult;
+  }
+
+  // 2) 如果是“新结构”（overallScore / dimensionScores / keyMoments / top3Fixes / nextPractice）
+  const hasNewShape =
+    typeof raw.overallScore === "number" &&
+    raw.dimensionScores &&
+    typeof raw.dimensionScores === "object";
+
+  if (!hasNewShape) {
+    // 不确定结构，原样返回（至少不阻塞）
+    return raw as ScoringResult;
+  }
+
+  const ds = raw.dimensionScores || {};
+  const toNum = (v: any, d = 0) => (typeof v === "number" ? v : d);
+
+  // dimensionScores (0-5) -> 旧结构的 5 项
+  const explore = toNum(ds.explore);
+  const suggest = toNum(ds.suggest);
+  const act = toNum(ds.act);
+  const confirm = toNum(ds.confirm);
+  const empathy = toNum(ds.empathy);
+  const clarity = toNum(ds.clarity);
+
+  const highlights: string[] = [];
+  const improvements: string[] = [];
+
+  if (Array.isArray(raw.keyMoments)) {
+    for (const km of raw.keyMoments.slice(0, 6)) {
+      if (km?.whatWentWell) highlights.push(String(km.whatWentWell));
+      if (km?.improve) improvements.push(String(km.improve));
+    }
+  }
+
+  if (Array.isArray(raw.top3Fixes)) {
+    for (const x of raw.top3Fixes) improvements.push(String(x));
+  }
+
+  const betterScript =
+    (raw.keyMoments?.[0]?.coachResponseIdeal && String(raw.keyMoments[0].coachResponseIdeal)) ||
+    (Array.isArray(raw.nextPractice?.microScript) ? raw.nextPractice.microScript.join(" / ") : "") ||
+    "";
+
+  const nextMove =
+    (raw.nextPractice?.nextUserPrompt && String(raw.nextPractice.nextUserPrompt)) ||
+    (raw.nextPractice?.focus && `下一轮聚焦：${String(raw.nextPractice.focus)}`) ||
+    "";
+
+  const riskAlert =
+    (raw.summary && String(raw.summary)) || "";
+
+  // 旧结构 stage_goal_hit（0~1 或 0~100？你原项目不确定）
+  // 这里给一个“0~1”的命中率（overallScore/100）
+  const stageGoalHit = Math.max(0, Math.min(1, toNum(raw.overallScore) / 100));
+
+  const mapped: any = {
+    stage: String(stage),
+    stage_goal_hit: stageGoalHit,
+    dimension_scores: {
+      "倾听与复述": Math.round(((explore + empathy) / 2) * 10) / 10,
+      "澄清与提问": Math.round(explore * 10) / 10,
+      "共情与态度": Math.round(empathy * 10) / 10,
+      "方案与承诺清晰": Math.round(((suggest + act + clarity) / 3) * 10) / 10,
+      "确认闭环": Math.round(confirm * 10) / 10,
+    },
+    highlights: highlights.length ? highlights.slice(0, 5) : ["能维持对话推进，具备基本服务态度。"],
+    improvements: improvements.length ? improvements.slice(0, 5) : ["加强探索提问与确认闭环。"],
+    better_script: betterScript || "我理解您的感受。为了更快解决，我想确认两点：…（开放式问题）",
+    next_move: nextMove || "请用 1 句共情 + 2 个开放式问题，先把客户真实需求问出来。",
+    risk_alert: riskAlert || undefined,
+  };
+
+  return mapped as ScoringResult;
+}
+
 export class GeminiService {
   /**
-   * ✅ TTS 改为走后端：/api/tts
-   * 后端会用 GEMINI_API_KEY 调 Gemini TTS，并返回 wav(base64)
+   * ✅ TTS：走后端 /api/tts
+   * 注意：当前返回的是 WAV(base64)。如果你在前端用 WebAudio 的 PCM 播放函数，
+   * 需要改成 Blob(audio/wav) 播放；或让后端改回 PCM（看你产品形态）。
    */
   async getTTSAudio(text: string, voiceName: string): Promise<string> {
     const data = await postJSON<TTSResp>("/api/tts", {
       text,
       voiceName,
-      // style: "温和/专业/安抚/坚定" 你也可以传
+      // style: "温和/专业/安抚/坚定"
       // model: "gemini-2.5-flash-preview-tts"
     });
     return data.audioBase64; // wav base64
   }
 
   /**
-   * ✅ 评分改为走后端：/api/review
-   * 后端会用 structured JSON schema 输出稳定结构
+   * ✅ 评分：走后端 /api/review，并做结构兼容
    */
   async scoreRound(
     stage: MOTStage,
@@ -56,22 +161,21 @@ export class GeminiService {
     customerText: string,
     practiceConfig: PracticeConfig
   ): Promise<ScoringResult> {
-    // 你现在的 ScoringResult 结构如果和后端不完全一致，可在这里做一次映射
     const transcript = `用户（服务者）："${userTranscript}"\n客户回应："${customerText}"`;
     const scenario = `${practiceConfig.industry}｜${practiceConfig.persona}｜${stage}`;
 
-    const result = await postJSON<ScoringResult>("/api/review", {
+    const raw = await postJSON<any>("/api/review", {
       scenario,
       transcript,
       // model: "gemini-2.5-flash"
     });
 
-    return result;
+    return normalizeScore(raw, stage);
   }
 
   /**
-   * ✅ Live 连接：先向后端拿 ephemeral token（/api/live-token），再用 token 作为 apiKey 去连 Live
-   * 这里必须 async
+   * ✅ Live：先从 /api/live-token 拿 ephemeral token，再用 token 连接 Live
+   * 官方说明 ephemeral token 目前仅兼容 Live，且需 v1alpha。
    */
   async connectLive(config: PracticeConfig, callbacks: any) {
     const playbook = MOT_PLAYBOOK[config.stage];
@@ -94,12 +198,20 @@ export class GeminiService {
     const tokenResp = await postJSON<LiveTokenResp>("/api/live-token", {
       model: "gemini-2.5-flash-native-audio-preview-12-2025",
       temperature: 0.7,
+      // 下面这些字段：如果你后端 live-token.ts 做了“锁配置”，可以一起传过去
+      // systemInstruction,
+      // voiceName: "Zephyr",
+      // responseModalities: ["AUDIO"],
     });
 
     // 2) 用 ephemeral token 作为 apiKey 创建客户端
-    const ai = new GoogleGenAI({ apiKey: tokenResp.token });
+    // ✅ 显式指定 v1alpha（ephemeral token only for Live & v1alpha）
+    const ai = new GoogleGenAI({
+      apiKey: tokenResp.token,
+      httpOptions: { apiVersion: "v1alpha" },
+    });
 
-    // 3) 连接 Live（这里继续用你原本的音频模式）
+    // 3) 连接 Live（音频对练 + 双向转写）
     return ai.live.connect({
       model: tokenResp.model,
       callbacks,
